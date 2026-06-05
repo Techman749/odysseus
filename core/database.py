@@ -1505,6 +1505,60 @@ class Integration(TimestampMixin, Base):
     enabled = Column(Boolean, default=True)
 
 
+class HealthSample(Base):
+    """A single health metric reading from Apple Health / Health Auto Export."""
+    __tablename__ = "health_samples"
+
+    id         = Column(String, primary_key=True, index=True)
+    owner      = Column(String, nullable=True, index=True)
+    metric     = Column(String, nullable=False)   # e.g. "heart_rate", "step_count", "sleep_analysis"
+    value      = Column(String, nullable=False)   # stored as string to handle numeric + categorical
+    unit       = Column(String, nullable=True)    # e.g. "count/min", "steps", "hr"
+    source     = Column(String, nullable=True)    # e.g. "Apple Watch", "iPhone"
+    sampled_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+    __table_args__ = (
+        Index('ix_health_samples_owner_metric_time', 'owner', 'metric', 'sampled_at'),
+    )
+
+
+class Medication(TimestampMixin, Base):
+    """A medication definition with dosing schedule."""
+    __tablename__ = "medications"
+
+    id            = Column(String, primary_key=True, index=True)
+    owner         = Column(String, nullable=True, index=True)
+    name          = Column(String, nullable=False)
+    dose          = Column(String, nullable=True)    # e.g. "10mg", "2 tablets"
+    instructions  = Column(Text, nullable=True)      # e.g. "take with food"
+    schedule_type = Column(String, default="daily")  # "daily", "weekly", "as_needed"
+    schedule_times = Column(Text, nullable=True)     # JSON list of "HH:MM" strings
+    schedule_days  = Column(Text, nullable=True)     # JSON list of day ints (0=Mon) for weekly
+    active        = Column(Boolean, default=True)
+
+    logs = relationship("MedicationLog", back_populates="medication", cascade="all, delete-orphan")
+
+
+class MedicationLog(Base):
+    """A taken/missed/skipped record for a medication dose."""
+    __tablename__ = "medication_logs"
+
+    id            = Column(String, primary_key=True, index=True)
+    medication_id = Column(String, ForeignKey("medications.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner         = Column(String, nullable=True, index=True)
+    status        = Column(String, nullable=False)   # "taken", "missed", "skipped"
+    scheduled_at  = Column(DateTime, nullable=False) # when it was due
+    logged_at     = Column(DateTime, default=utcnow_naive, nullable=False)
+    notes         = Column(Text, nullable=True)
+
+    medication = relationship("Medication", back_populates="logs")
+
+    __table_args__ = (
+        Index('ix_medication_logs_owner_time', 'owner', 'scheduled_at'),
+    )
+
+
 
 
 
@@ -1617,6 +1671,7 @@ def init_db():
     _migrate_drop_ping_notes_tasks()
     _migrate_add_crew_member_id()
     _migrate_add_assistant_columns()
+    _migrate_add_health_tables()
     _migrate_add_email_smtp_security()
     _migrate_seed_email_account()
     _migrate_add_calendar_metadata()
@@ -1784,6 +1839,77 @@ def _migrate_add_calendar_origin():
         conn.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"calendar_events.origin migration failed: {e}")
+
+
+def _migrate_add_health_tables():
+    """Create health_samples, medications, and medication_logs tables if missing."""
+    try:
+        with engine.connect() as conn:
+            tables = {r[0] for r in conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ))}
+            if "health_samples" not in tables:
+                conn.execute(text("""
+                    CREATE TABLE health_samples (
+                        id VARCHAR PRIMARY KEY,
+                        owner VARCHAR,
+                        metric VARCHAR NOT NULL,
+                        value VARCHAR NOT NULL,
+                        unit VARCHAR,
+                        source VARCHAR,
+                        sampled_at DATETIME NOT NULL,
+                        created_at DATETIME NOT NULL
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_health_samples_owner_metric_time "
+                    "ON health_samples (owner, metric, sampled_at)"
+                ))
+                logging.getLogger(__name__).info("Created health_samples table")
+            if "medications" not in tables:
+                conn.execute(text("""
+                    CREATE TABLE medications (
+                        id VARCHAR PRIMARY KEY,
+                        owner VARCHAR,
+                        name VARCHAR NOT NULL,
+                        dose VARCHAR,
+                        instructions TEXT,
+                        schedule_type VARCHAR DEFAULT 'daily',
+                        schedule_times TEXT,
+                        schedule_days TEXT,
+                        active BOOLEAN DEFAULT 1,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_medications_owner ON medications (owner)"
+                ))
+                logging.getLogger(__name__).info("Created medications table")
+            if "medication_logs" not in tables:
+                conn.execute(text("""
+                    CREATE TABLE medication_logs (
+                        id VARCHAR PRIMARY KEY,
+                        medication_id VARCHAR NOT NULL REFERENCES medications(id) ON DELETE CASCADE,
+                        owner VARCHAR,
+                        status VARCHAR NOT NULL,
+                        scheduled_at DATETIME NOT NULL,
+                        logged_at DATETIME NOT NULL,
+                        notes TEXT
+                    )
+                """))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_medication_logs_med "
+                    "ON medication_logs (medication_id)"
+                ))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_medication_logs_owner_time "
+                    "ON medication_logs (owner, scheduled_at)"
+                ))
+                logging.getLogger(__name__).info("Created medication_logs table")
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"health tables migration failed: {e}")
 
 
 def _migrate_add_calendar_metadata():
