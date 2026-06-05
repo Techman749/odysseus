@@ -2001,6 +2001,94 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         return str(e), False
 
 
+async def action_medication_reminders(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Check for medications due within the current 30-minute window and push
+    an ntfy reminder for each one. Designed to run on a cron schedule every
+    30 minutes (e.g. ``*/30 * * * *``).
+
+    Only fires for medications whose schedule_times contain an HH:MM entry
+    that falls within [now, now + 30 min). Weekly medications also check the
+    current day-of-week. As-needed medications are skipped.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td
+    from core.database import SessionLocal as _SL, Medication as _Med
+    from src.notifications import ntfy as _ntfy
+
+    try:
+        now = _dt.utcnow()
+        window_end = now + _td(minutes=30)
+
+        db = _SL()
+        try:
+            meds = db.query(_Med).filter(
+                _Med.owner == owner,
+                _Med.active == True,  # noqa: E712
+                _Med.schedule_type.in_(["daily", "weekly"]),
+            ).all()
+        finally:
+            db.close()
+
+        due = []
+        for med in meds:
+            times = _json.loads(med.schedule_times or "[]")
+            days = _json.loads(med.schedule_days or "[]")
+
+            for t in times:
+                try:
+                    h, m = map(int, t.split(":"))
+                except Exception:
+                    continue
+                candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                # Also check the candidate shifted to tomorrow for near-midnight windows
+                for delta_days in (0, 1):
+                    from datetime import timedelta
+                    c = candidate + timedelta(days=delta_days)
+                    if now <= c < window_end:
+                        if med.schedule_type == "weekly" and days:
+                            # days are 0=Mon … 6=Sun
+                            if c.weekday() not in days:
+                                continue
+                        due.append((med, t))
+                        break
+
+        if not due:
+            return "No medications due in the next 30 minutes.", True
+
+        sent, failed = [], []
+        for med, dose_time in due:
+            parts = [f"Time to take {med.name}"]
+            if med.dose:
+                parts.append(med.dose)
+            if med.instructions:
+                parts.append(f"({med.instructions})")
+            message = " — ".join(parts[:1]) + (f" {med.dose}" if med.dose else "")
+            detail = med.instructions or ""
+
+            ok = await _ntfy.send(
+                topic=_ntfy.topic("health"),
+                message=message + (f"\n{detail}" if detail else ""),
+                title="Medication Reminder",
+                priority="high",
+                tags=["pill", "bell"],
+            )
+            if ok:
+                sent.append(med.name)
+            else:
+                failed.append(med.name)
+
+        lines = []
+        if sent:
+            lines.append(f"Reminders sent for: {', '.join(sent)}")
+        if failed:
+            lines.append(f"ntfy delivery failed for: {', '.join(failed)}")
+        return "\n".join(lines), len(failed) == 0
+
+    except Exception as e:
+        logger.exception("medication_reminders action failed")
+        return str(e), False
+
+
 BUILTIN_ACTIONS = {
     "tidy_sessions": action_tidy_sessions,
     "tidy_documents": action_tidy_documents,
@@ -2020,6 +2108,7 @@ BUILTIN_ACTIONS = {
     "test_skills": action_test_skills,
     "audit_skills": action_audit_skills,
     "check_email_urgency": action_check_email_urgency,
+    "medication_reminders": action_medication_reminders,
     # ping_notes removed from the registry — runs only inside `_note_pings_loop`.
 }
 
@@ -2040,4 +2129,5 @@ BUILTIN_ACTION_INFO = {
     "test_skills": "Run the per-skill Test on every skill: agent run + LLM judge → records verdict on the skill (pass/needs_work/fail/inconclusive). Advisory only — never rewrites or demotes anything.",
     "audit_skills": "Audit unaudited skills after enough new skills are added: test, narrow metadata, self-edit/retry, optional teacher rewrite, tag duplicates/trivial skills, and publish/draft using the auto-approve threshold.",
     "check_email_urgency": "Scan unread emails hourly, tag urgent/reply-soon/newsletter/marketing/spam, and send a reminder when a new email needs a fast reply.",
+    "medication_reminders": "Check for medications due in the next 30 minutes and push an ntfy reminder for each one. Schedule every 30 minutes via cron.",
 }
