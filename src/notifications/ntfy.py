@@ -50,8 +50,13 @@ async def send(
     title: Optional[str] = None,
     priority: str = "default",
     tags: Optional[list] = None,
+    extra_headers: Optional[dict] = None,
 ) -> bool:
-    """Send an ntfy push notification. Returns True on success."""
+    """Send an ntfy push notification. Returns True on success.
+
+    extra_headers can include ntfy-specific headers such as ``Actions``,
+    ``Click``, ``Attach``, etc.
+    """
     base_url, api_key = _resolve_ntfy_config()
 
     # Support bare topic names and full topic paths
@@ -69,6 +74,8 @@ async def send(
         headers["Tags"] = ",".join(tags)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if extra_headers:
+        headers.update(extra_headers)
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

@@ -2002,23 +2002,55 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
 
 
 async def action_medication_reminders(owner: str, **kwargs) -> Tuple[str, bool]:
-    """Check for medications due within the current 30-minute window and push
-    an ntfy reminder for each one. Designed to run on a cron schedule every
-    30 minutes (e.g. ``*/30 * * * *``).
+    """Check medications every 30 minutes and:
+    - Push an ntfy reminder for any dose due in the next 30-minute window,
+      with "Mark Taken" and "Skip" action buttons that call back to Odysseus.
+    - Auto-log a "missed" entry for any dose that had no taken/skipped log
+      recorded within 90 minutes of its scheduled time.
 
-    Only fires for medications whose schedule_times contain an HH:MM entry
-    that falls within [now, now + 30 min). Weekly medications also check the
-    current day-of-week. As-needed medications are skipped.
+    Designed to run on a cron schedule: ``*/30 * * * *``.
+    State is persisted in ``data/med_reminders_{owner}.json`` so reminders
+    are never double-sent within the same 25-minute guard window.
     """
+    import hashlib
+    import hmac as _hmac
     import json as _json
-    from datetime import datetime as _dt, timedelta as _td
-    from core.database import SessionLocal as _SL, Medication as _Med
+    import os as _os
+    import uuid as _uuid
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from pathlib import Path as _P
+    from core.database import (
+        SessionLocal as _SL, Medication as _Med, MedicationLog as _MedLog, utcnow_naive,
+    )
     from src.notifications import ntfy as _ntfy
 
-    try:
-        now = _dt.utcnow()
-        window_end = now + _td(minutes=30)
+    REMIND_WINDOW_MIN = 30   # look ahead this many minutes
+    REPING_GUARD_MIN  = 25   # suppress re-send within this window
+    MISSED_AFTER_MIN  = 90   # auto-log missed if no log recorded this long after due time
+    STATE_TTL_HOURS   = 48   # prune state entries older than this
 
+    _owner_slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+    STATE = _P(f"data/med_reminders_{_owner_slug}.json")
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        state: dict = _json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+    except Exception:
+        state = {}
+
+    base_url = _os.getenv("ODYSSEUS_BASE_URL", "http://192.168.1.121:7000").rstrip("/")
+    secret   = _os.getenv("HEALTH_WEBHOOK_SECRET", "")
+
+    def _sign(med_id: str, scheduled_at: str, status: str) -> str:
+        payload = f"{med_id}:{scheduled_at}:{status}"
+        if secret:
+            return _hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+    def _state_key(med_id: str, date_str: str, time_str: str) -> str:
+        return f"{med_id}_{date_str}_{time_str.replace(':', '')}"
+
+    try:
         db = _SL()
         try:
             meds = db.query(_Med).filter(
@@ -2029,60 +2061,149 @@ async def action_medication_reminders(owner: str, **kwargs) -> Tuple[str, bool]:
         finally:
             db.close()
 
-        due = []
+        now_utc   = _dt.now(_tz.utc)
+        now_naive = now_utc.replace(tzinfo=None)
+        reping_cutoff = now_utc - _td(minutes=REPING_GUARD_MIN)
+
+        sent_names, failed_names, auto_missed_names = [], [], []
+
         for med in meds:
             times = _json.loads(med.schedule_times or "[]")
-            days = _json.loads(med.schedule_days or "[]")
+            days  = _json.loads(med.schedule_days or "[]")
 
             for t in times:
                 try:
                     h, m = map(int, t.split(":"))
                 except Exception:
                     continue
-                candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                # Also check the candidate shifted to tomorrow for near-midnight windows
-                for delta_days in (0, 1):
-                    from datetime import timedelta
-                    c = candidate + timedelta(days=delta_days)
-                    if now <= c < window_end:
-                        if med.schedule_type == "weekly" and days:
-                            # days are 0=Mon … 6=Sun
-                            if c.weekday() not in days:
-                                continue
-                        due.append((med, t))
-                        break
 
-        if not due:
-            return "No medications due in the next 30 minutes.", True
+                # Evaluate yesterday, today, and tomorrow so near-midnight
+                # windows and missed-dose lookbacks both work correctly.
+                for delta_days in (-1, 0, 1):
+                    base_day      = now_naive + _td(days=delta_days)
+                    candidate_naive = _dt(base_day.year, base_day.month, base_day.day, h, m, 0)
+                    candidate_utc   = candidate_naive.replace(tzinfo=_tz.utc)
 
-        sent, failed = [], []
-        for med, dose_time in due:
-            parts = [f"Time to take {med.name}"]
-            if med.dose:
-                parts.append(med.dose)
-            if med.instructions:
-                parts.append(f"({med.instructions})")
-            message = " — ".join(parts[:1]) + (f" {med.dose}" if med.dose else "")
-            detail = med.instructions or ""
+                    if med.schedule_type == "weekly" and days:
+                        if candidate_naive.weekday() not in days:
+                            continue
 
-            ok = await _ntfy.send(
-                topic=_ntfy.topic("health"),
-                message=message + (f"\n{detail}" if detail else ""),
-                title="Medication Reminder",
-                priority="high",
-                tags=["pill", "bell"],
-            )
-            if ok:
-                sent.append(med.name)
-            else:
-                failed.append(med.name)
+                    date_str      = candidate_naive.strftime("%Y-%m-%d")
+                    remind_key    = _state_key(med.id, date_str, t)
+                    missed_key    = f"missed_{remind_key}"
+                    scheduled_iso = candidate_naive.isoformat()
+
+                    # ── Upcoming reminder ────────────────────────────────────
+                    if now_utc <= candidate_utc < now_utc + _td(minutes=REMIND_WINDOW_MIN):
+                        last_reminded = state.get(remind_key)
+                        should_remind = True
+                        if last_reminded:
+                            try:
+                                last_dt = _dt.fromisoformat(last_reminded)
+                                if last_dt.tzinfo is None:
+                                    last_dt = last_dt.replace(tzinfo=_tz.utc)
+                                if last_dt >= reping_cutoff:
+                                    should_remind = False
+                            except Exception:
+                                pass
+
+                        if should_remind:
+                            msg = f"Time to take {med.name}"
+                            if med.dose:
+                                msg += f" — {med.dose}"
+                            if med.instructions:
+                                msg += f"\n{med.instructions}"
+
+                            taken_sig = _sign(med.id, scheduled_iso, "taken")
+                            skip_sig  = _sign(med.id, scheduled_iso, "skipped")
+                            taken_url = (
+                                f"{base_url}/api/health/quick-log"
+                                f"?med_id={med.id}&scheduled_at={scheduled_iso}"
+                                f"&status=taken&sig={taken_sig}"
+                            )
+                            skip_url = (
+                                f"{base_url}/api/health/quick-log"
+                                f"?med_id={med.id}&scheduled_at={scheduled_iso}"
+                                f"&status=skipped&sig={skip_sig}"
+                            )
+                            actions = (
+                                f"http, Mark Taken, {taken_url}, method=POST; "
+                                f"http, Skip, {skip_url}, method=POST"
+                            )
+
+                            ok = await _ntfy.send(
+                                topic=_ntfy.topic("health"),
+                                message=msg,
+                                title="Medication Reminder",
+                                priority="high",
+                                tags=["pill", "bell"],
+                                extra_headers={"Actions": actions},
+                            )
+                            if ok:
+                                state[remind_key] = now_utc.isoformat()
+                                sent_names.append(med.name)
+                            else:
+                                failed_names.append(med.name)
+
+                    # ── Missed dose detection ────────────────────────────────
+                    elif (
+                        candidate_utc < now_utc - _td(minutes=MISSED_AFTER_MIN)
+                        and now_utc - candidate_utc < _td(hours=24)
+                        and missed_key not in state
+                    ):
+                        db2 = _SL()
+                        try:
+                            log_exists = db2.query(_MedLog).filter(
+                                _MedLog.medication_id == med.id,
+                                _MedLog.scheduled_at >= candidate_naive - _td(minutes=30),
+                                _MedLog.scheduled_at <= candidate_naive + _td(minutes=30),
+                                _MedLog.status.in_(["taken", "skipped"]),
+                            ).first()
+                        finally:
+                            db2.close()
+
+                        if not log_exists:
+                            db3 = _SL()
+                            try:
+                                entry = _MedLog(
+                                    id=_uuid.uuid4().hex,
+                                    medication_id=med.id,
+                                    owner=owner,
+                                    status="missed",
+                                    scheduled_at=candidate_naive,
+                                    logged_at=utcnow_naive(),
+                                    notes="Auto-logged as missed by medication reminder action",
+                                )
+                                db3.add(entry)
+                                db3.commit()
+                                auto_missed_names.append(f"{med.name} at {t}")
+                            except Exception as e:
+                                logger.warning("medication_reminders: missed-log failed for %s: %s", med.name, e)
+                            finally:
+                                db3.close()
+
+                        # Record that we've processed this slot either way
+                        state[missed_key] = now_utc.isoformat()
+
+        # Prune state entries older than STATE_TTL_HOURS
+        ttl_cutoff = (now_utc - _td(hours=STATE_TTL_HOURS)).isoformat()
+        state = {k: v for k, v in state.items() if v >= ttl_cutoff}
+
+        try:
+            STATE.write_text(_json.dumps(state), encoding="utf-8")
+        except Exception as e:
+            logger.warning("medication_reminders: state write failed: %s", e)
 
         lines = []
-        if sent:
-            lines.append(f"Reminders sent for: {', '.join(sent)}")
-        if failed:
-            lines.append(f"ntfy delivery failed for: {', '.join(failed)}")
-        return "\n".join(lines), len(failed) == 0
+        if sent_names:
+            lines.append(f"Reminders sent: {', '.join(sent_names)}")
+        if failed_names:
+            lines.append(f"ntfy delivery failed: {', '.join(failed_names)}")
+        if auto_missed_names:
+            lines.append(f"Auto-logged as missed: {', '.join(auto_missed_names)}")
+        if not lines:
+            lines.append("No medications due or missed in this window.")
+        return "\n".join(lines), len(failed_names) == 0
 
     except Exception as e:
         logger.exception("medication_reminders action failed")

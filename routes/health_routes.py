@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import urllib.parse
 import logging
 import os
 import uuid
@@ -18,6 +19,15 @@ from src.auth_helpers import get_current_user
 logger = logging.getLogger(__name__)
 
 WEBHOOK_SECRET = os.getenv("HEALTH_WEBHOOK_SECRET", "")
+
+
+def _sign_dose_token(med_id: str, scheduled_at: str, status: str) -> str:
+    """Generate the HMAC-SHA256 signature used by quick-log and action buttons.
+    Falls back to a plain SHA-256 hash when HEALTH_WEBHOOK_SECRET is unset."""
+    payload = f"{med_id}:{scheduled_at}:{status}"
+    if WEBHOOK_SECRET:
+        return hmac.new(WEBHOOK_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
 def _get_admin_username() -> str:
@@ -278,6 +288,75 @@ def setup_health_routes() -> APIRouter:
                     }
                     for r in rows
                 }
+            }
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
+    # Quick-log: unauthenticated endpoint for ntfy action buttons
+    # ------------------------------------------------------------------
+
+    @router.post("/quick-log", status_code=201)
+    async def quick_log_dose(
+        med_id: str,
+        scheduled_at: str,
+        status: str,
+        sig: str,
+    ):
+        """Log a dose taken/skipped without a browser session.
+
+        Called by ntfy action buttons embedded in medication reminder pushes.
+        The ``sig`` parameter is an HMAC-SHA256 signature over
+        ``{med_id}:{scheduled_at}:{status}`` using HEALTH_WEBHOOK_SECRET.
+        When no secret is configured every request is accepted (local-network
+        deployments where the server is not internet-exposed).
+        """
+        if status not in ("taken", "skipped"):
+            raise HTTPException(status_code=400, detail="status must be taken or skipped")
+
+        expected = _sign_dose_token(med_id, scheduled_at, status)
+        if not hmac.compare_digest(expected, sig or ""):
+            raise HTTPException(status_code=403, detail="Invalid signature")
+
+        try:
+            scheduled_naive = datetime.fromisoformat(scheduled_at).replace(tzinfo=None)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid scheduled_at")
+
+        db = SessionLocal()
+        try:
+            med = db.query(Medication).filter(Medication.id == med_id).first()
+            if not med:
+                raise HTTPException(status_code=404, detail="Medication not found")
+
+            # Idempotent: don't double-log the same dose window
+            from datetime import timedelta as _td
+            existing = db.query(MedicationLog).filter(
+                MedicationLog.medication_id == med_id,
+                MedicationLog.scheduled_at >= scheduled_naive - _td(minutes=30),
+                MedicationLog.scheduled_at <= scheduled_naive + _td(minutes=30),
+                MedicationLog.status.in_(["taken", "skipped"]),
+            ).first()
+            if existing:
+                return {"id": existing.id, "status": existing.status, "already_logged": True}
+
+            entry = MedicationLog(
+                id=uuid.uuid4().hex,
+                medication_id=med_id,
+                owner=med.owner,
+                status=status,
+                scheduled_at=scheduled_naive,
+                logged_at=utcnow_naive(),
+                notes="Logged via ntfy action button",
+            )
+            db.add(entry)
+            db.commit()
+            db.refresh(entry)
+            return {
+                "id": entry.id,
+                "medication": med.name,
+                "status": entry.status,
+                "scheduled_at": entry.scheduled_at.isoformat(),
             }
         finally:
             db.close()
